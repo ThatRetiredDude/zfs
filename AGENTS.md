@@ -122,3 +122,29 @@ zfs_scratch_dir=$(mktemp -d /var/tmp/zfs-zloop.XXXXXX) || exit 1
   commit body when needed; follow `CONTRIBUTING.md` for override precedence.
 - Do not commit generated `configure`, `Makefile.in`, `zfs_config.h`, editor
   files or build output; `.abi` updates require the review described above.
+
+## Cursor Cloud specific instructions
+
+The Cloud Agent kernel does not provide matching `linux-headers`, so a
+default `./configure` (`--with-config=all`) cannot build kernel modules.
+Configure userspace the same way as `.github/workflows/unit-tests.yml`:
+
+```sh
+./autogen.sh
+./configure --with-config=user --enable-debug --enable-debuginfo
+make -j$(nproc)
+make unit
+```
+
+`ztest` is the in-process pool exerciser. Run it from a scratch directory
+and remove that directory afterwards:
+
+```sh
+mkdir -p /var/tmp/zfs-ztest
+./ztest -f /var/tmp/zfs-ztest -T 40 -P 15
+rm -rf /var/tmp/zfs-ztest
+```
+
+Leave `scripts/zfs.sh` and `zfs-tests.sh` unused here. They load kernel
+modules and create and destroy pools, and those modules cannot be built
+on this kernel.
