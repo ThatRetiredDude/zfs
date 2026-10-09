@@ -5384,20 +5384,22 @@ vdev_deflated_space(vdev_t *vd, int64_t space)
  * The raidz_expansion_accounting feature records the txg at which per-block
  * ratio tracking was enabled.  Blocks born before that txg were accounted
  * using the legacy fixed ratio, so we must continue using it for those
- * blocks to prevent born/free mismatches.
+ * blocks to prevent born/free mismatches.  Blocks born in that txg itself
+ * were also charged at the legacy ratio, because the feature is activated
+ * by a sync task, which runs after the txg's dirty datasets are synced.
  */
 uint64_t
 vdev_get_deflate_ratio(vdev_t *vd, uint64_t birth_txg)
 {
 	/*
 	 * If the raidz_expansion_accounting feature is not active, or
-	 * this block was born before the feature was enabled, use the
-	 * legacy fixed ratio.  This ensures blocks that were accounted
+	 * this block was born in or before the txg that enabled it, use
+	 * the legacy fixed ratio.  This ensures blocks that were accounted
 	 * under the old code are freed with the same ratio they were born
 	 * with.
 	 */
 	uint64_t acct_txg = vd->vdev_spa->spa_raidz_expand_acct_txg;
-	if (acct_txg == 0 || birth_txg < acct_txg)
+	if (acct_txg == 0 || birth_txg <= acct_txg)
 		return (vd->vdev_deflate_ratio);
 
 	uint64_t asize_at_birth = vdev_psize_to_asize_txg(vd, 1 << 17,
