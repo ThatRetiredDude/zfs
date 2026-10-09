@@ -14,6 +14,7 @@
 *
 
 !.github
+!.cursor
 !cmd
 !config
 !contrib
@@ -28,6 +29,7 @@
 !udev
 
 !.github/**
+!.cursor/**
 !cmd/**
 !config/**
 !contrib/**

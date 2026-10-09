@@ -1,0 +1,4 @@
+{
+  "name": "OpenZFS userspace",
+  "install": "bash .cursor/cloud-agent-install.sh"
+}

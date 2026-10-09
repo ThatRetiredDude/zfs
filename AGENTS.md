@@ -125,6 +125,9 @@ zfs_scratch_dir=$(mktemp -d /var/tmp/zfs-zloop.XXXXXX) || exit 1
 
 ## Cursor Cloud specific instructions
 
+Setup for this fork is stored in `.cursor/environment.json`,
+`.cursor/cloud-agent-install.sh`, and `.cursor/cloud-agent-setup.md`.
+
 The Cloud Agent kernel does not provide matching `linux-headers`, so a
 default `./configure` (`--with-config=all`) cannot build kernel modules.
 Configure userspace the same way as `.github/workflows/unit-tests.yml`:
