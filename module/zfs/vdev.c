@@ -5397,7 +5397,7 @@ vdev_get_deflate_ratio(vdev_t *vd, uint64_t birth_txg)
 	 * with.
 	 */
 	uint64_t acct_txg = vd->vdev_spa->spa_raidz_expand_acct_txg;
-	if (acct_txg == 0 || birth_txg < acct_txg)
+	if (acct_txg == 0 || birth_txg <= acct_txg)
 		return (vd->vdev_deflate_ratio);
 
 	uint64_t asize_at_birth = vdev_psize_to_asize_txg(vd, 1 << 17,
