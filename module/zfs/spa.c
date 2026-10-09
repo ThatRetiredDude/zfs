@@ -491,39 +491,11 @@ spa_prop_get_config(spa_t *spa, nvlist_t *nv)
 		spa_prop_add_list(nv, ZPOOL_PROP_NAME, spa_name(spa), 0, src);
 
 		/*
-		 * For expanded RAIDZ vdevs, the metaslab class dspace
-		 * was computed using the original (txg 0) deflation
-		 * ratio, which understates usable capacity.  Compute
-		 * a correction for the normal class using only the
-		 * FREE portion of each vdev.  See spa_update_dspace()
-		 * for the rationale.
+		 * Revalue free space on expanded RAIDZ vdevs at the
+		 * current geometry; see spa_update_dspace().
 		 */
-		int64_t normal_dspace_corr = 0;
-		if (spa_deflate(spa)) {
-			for (uint64_t c = 0; c < rvd->vdev_children; c++) {
-				vdev_t *vd = rvd->vdev_child[c];
-				if (vd->vdev_mg == NULL ||
-				    vd->vdev_mg->mg_class != mc)
-					continue;
-				if (vd->vdev_deflate_ratio_current != 0 &&
-				    vd->vdev_deflate_ratio_current !=
-				    vd->vdev_deflate_ratio) {
-					uint64_t space =
-					    vd->vdev_stat.vs_space;
-					uint64_t aspace =
-					    vd->vdev_stat.vs_alloc;
-					uint64_t fspace = space - aspace;
-					int64_t old_fs = (fspace >>
-					    SPA_MINBLOCKSHIFT) *
-					    vd->vdev_deflate_ratio;
-					int64_t new_fs = (fspace >>
-					    SPA_MINBLOCKSHIFT) *
-					    vd->vdev_deflate_ratio_current;
-					normal_dspace_corr +=
-					    (new_fs - old_fs);
-				}
-			}
-		}
+		int64_t normal_dspace_corr =
+		    spa_raidz_expand_dspace_correction(spa);
 
 		size = alloc = usable = used = 0;
 		spa_prop_add_metaslab_class(nv, mc, ZPOOL_MC_PROPS_NORMAL,
@@ -2510,6 +2482,7 @@ spa_unload(spa_t *spa)
 	}
 
 	spa->spa_raidz_expand = NULL;
+	spa->spa_raidz_expand_acct_txg = 0;
 	spa->spa_checkpoint_txg = 0;
 
 	spa_config_exit(spa, SCL_ALL, spa);
@@ -5343,15 +5316,24 @@ spa_ld_check_features(spa_t *spa, boolean_t *missing_feat_writep)
 	}
 
 	/*
-	 * Cache the txg at which per-block deflate ratio accounting was
-	 * enabled.  Blocks born before this txg use the legacy fixed ratio;
-	 * blocks born at or after this txg use per-birth-txg ratios.
+	 * Load the boundary txg for per-block deflate ratio accounting
+	 * (see spa_raidz_expand_acct_activate()).  Blocks born before it
+	 * use the legacy fixed ratio; blocks born at or after it use
+	 * per-birth-txg ratios.  Always assign it, since a spa_t can be
+	 * reloaded (spa_load_retry()) at an older txg.
 	 */
+	spa->spa_raidz_expand_acct_txg = 0;
 	if (spa_feature_is_active(spa,
 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING)) {
-		(void) spa_feature_enabled_txg(spa,
-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
-		    &spa->spa_raidz_expand_acct_txg);
+		error = zap_lookup(spa->spa_meta_objset,
+		    DMU_POOL_DIRECTORY_OBJECT, DMU_POOL_RAIDZ_EXPAND_ACCT_TXG,
+		    sizeof (uint64_t), 1, &spa->spa_raidz_expand_acct_txg);
+		if (error != 0 || spa->spa_raidz_expand_acct_txg == 0) {
+			spa_load_failed(spa, "raidz_expansion_accounting is "
+			    "active but its boundary txg is missing [error=%d]",
+			    error);
+			return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, EIO));
+		}
 	}
 
 	/*

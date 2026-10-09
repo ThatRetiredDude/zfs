@@ -2013,6 +2013,61 @@ spa_get_checkpoint_space(spa_t *spa)
 	return (spa->spa_checkpoint_info.sci_dspace);
 }
 
+/*
+ * For expanded RAIDZ vdevs in the normal class, metaslab_class_get_dspace()
+ * deflates all space with the original (txg 0) ratio, which understates
+ * the capacity available to new writes.  Return the correction to apply:
+ * the vdev's FREE space revalued at the current-geometry ratio.  See
+ * spa_update_dspace() for why only free space is corrected.
+ *
+ * vs_space/vs_alloc cover every metaslab of the vdev, including an
+ * embedded log metaslab that belongs to the embedded log class rather
+ * than the normal class, so that metaslab's free space is excluded.
+ */
+int64_t
+spa_raidz_expand_dspace_correction(spa_t *spa)
+{
+	metaslab_class_t *mc = spa_normal_class(spa);
+	vdev_t *rvd = spa->spa_root_vdev;
+	int64_t correction = 0;
+
+	if (!spa_deflate(spa) || rvd == NULL)
+		return (0);
+
+	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+		vdev_t *vd = rvd->vdev_child[c];
+
+		if (vd->vdev_mg == NULL || vd->vdev_mg->mg_class != mc)
+			continue;
+		if (vd->vdev_deflate_ratio_current <= vd->vdev_deflate_ratio)
+			continue;
+
+		mutex_enter(&vd->vdev_stat_lock);
+		uint64_t space = vd->vdev_stat.vs_space;
+		uint64_t alloc = vd->vdev_stat.vs_alloc;
+		mutex_exit(&vd->vdev_stat_lock);
+		uint64_t fspace = (space > alloc) ? space - alloc : 0;
+
+		metaslab_group_t *lmg = vd->vdev_log_mg;
+		if (lmg != NULL) {
+			avl_tree_t *t = &lmg->mg_metaslab_tree;
+			mutex_enter(&lmg->mg_lock);
+			for (metaslab_t *msp = avl_first(t); msp != NULL;
+			    msp = AVL_NEXT(t, msp)) {
+				uint64_t lfree = msp->ms_size -
+				    metaslab_allocated_space(msp);
+				fspace -= MIN(fspace, lfree);
+			}
+			mutex_exit(&lmg->mg_lock);
+		}
+
+		correction += (fspace >> SPA_MINBLOCKSHIFT) *
+		    (vd->vdev_deflate_ratio_current - vd->vdev_deflate_ratio);
+	}
+
+	return (correction);
+}
+
 void
 spa_update_dspace(spa_t *spa)
 {
@@ -2024,47 +2079,23 @@ spa_update_dspace(spa_t *spa)
 	 * usable capacity.  Apply a correction using the current geometry
 	 * ratio, but only for the FREE portion of the vdev.
 	 *
-	 * The allocated portion must remain at the old ratio because
-	 * dd_used_bytes (tracked per-block via bp_get_dsize_sync) also
-	 * uses the old ratio for blocks born before the expansion
-	 * accounting feature was enabled.  Correcting only the free
-	 * portion keeps spa_rdspace - dd_used_bytes = true available.
+	 * The allocated portion stays at the old ratio because, while the
+	 * raidz_expansion_accounting feature is inactive, dd_used_bytes
+	 * charges every block at that ratio (bp_get_dsize_sync()).  Then
+	 * spa_rdspace - dd_used_bytes == free space at the current ratio,
+	 * exactly, whatever the block sizes.
 	 *
-	 * As old blocks are rewritten with the new geometry, vs_alloc
-	 * shrinks (less physical space per block) and the correction
-	 * automatically grows, converging to the full correction after
-	 * a complete rewrite.
+	 * XXX Once the feature is active this no longer holds: blocks born
+	 * at or after spa_raidz_expand_acct_txg are charged at their birth
+	 * ratio, but are still counted here at the old ratio, so available
+	 * space is understated by (birth ratio - old ratio) for each of
+	 * them.  Fixing that needs the allocated space charged at each
+	 * ratio to be tracked per vdev; see the review notes.
 	 *
 	 * Only correct vdevs in the normal class, matching spa_rdspace's
-	 * derivation from spa_normal_class().  RAIDZ vdevs in the special
-	 * or dedup class contribute only allocated (not free) space to
-	 * spa_dspace via metaslab_class_get_dalloc(), so they do not need
-	 * a free-space correction.
+	 * derivation from spa_normal_class().
 	 */
-	if (spa_deflate(spa)) {
-		metaslab_class_t *mc = spa_normal_class(spa);
-		vdev_t *rvd = spa->spa_root_vdev;
-		for (uint64_t c = 0; c < rvd->vdev_children; c++) {
-			vdev_t *vd = rvd->vdev_child[c];
-			if (vd->vdev_mg == NULL ||
-			    vd->vdev_mg->mg_class != mc)
-				continue;
-			if (vd->vdev_deflate_ratio_current != 0 &&
-			    vd->vdev_deflate_ratio_current !=
-			    vd->vdev_deflate_ratio) {
-				uint64_t space = vd->vdev_stat.vs_space;
-				uint64_t aspace = vd->vdev_stat.vs_alloc;
-				uint64_t fspace = space - aspace;
-				int64_t old_fs = (fspace >>
-				    SPA_MINBLOCKSHIFT) *
-				    vd->vdev_deflate_ratio;
-				int64_t new_fs = (fspace >>
-				    SPA_MINBLOCKSHIFT) *
-				    vd->vdev_deflate_ratio_current;
-				spa->spa_rdspace += (new_fs - old_fs);
-			}
-		}
-	}
+	spa->spa_rdspace += spa_raidz_expand_dspace_correction(spa);
 
 	if (spa->spa_nonallocating_dspace > 0) {
 		/*

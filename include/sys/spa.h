@@ -1157,6 +1157,7 @@ extern boolean_t spa_has_spare(spa_t *, uint64_t guid);
 extern uint64_t dva_get_dsize_sync(spa_t *spa, const dva_t *dva,
     uint64_t birth_txg);
 extern uint64_t bp_get_dsize_sync(spa_t *spa, const blkptr_t *bp);
+extern int64_t spa_raidz_expand_dspace_correction(spa_t *spa);
 extern uint64_t bp_get_dsize(spa_t *spa, const blkptr_t *bp);
 extern boolean_t spa_has_dedup(spa_t *spa);
 extern boolean_t spa_has_slogs(spa_t *spa);

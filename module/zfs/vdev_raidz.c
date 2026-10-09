@@ -4228,6 +4228,13 @@ raidz_reflow_complete_sync(void *arg, dmu_tx_t *tx)
 	avl_add(&vdrz->vd_expand_txgs, re);
 	mutex_exit(&vdrz->vd_expand_lock);
 
+	/*
+	 * Recompute vdev_deflate_ratio_current now that the new logical
+	 * width is in vd_expand_txgs, so capacity reporting reflects the
+	 * new geometry without waiting for the pool to be re-imported.
+	 */
+	vdev_set_deflate_ratio(raidvd);
+
 	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
 
 	/*
@@ -5225,6 +5232,44 @@ vdev_raidz_attach_check(vdev_t *new_child)
 	return (0);
 }
 
+/*
+ * Activate the raidz_expansion_accounting feature.  From the returned
+ * boundary txg onward, blocks are charged with the deflate ratio of the
+ * geometry they were born under (vdev_get_deflate_ratio()); blocks born
+ * earlier keep the legacy txg-0 ratio.
+ *
+ * The boundary is the txg AFTER activation, not the activation txg:
+ * this runs from a sync task, and dsl_pool_sync() runs sync tasks only
+ * after every dirty dataset (and the MOS) has been written in pass 1, so
+ * blocks born earlier in this same txg were already charged at the
+ * legacy ratio.  Using this txg as the boundary would free them at a
+ * different ratio than they were born with.
+ *
+ * The boundary is persisted in the MOS rather than derived from the
+ * feature's enabled_txg, because an expansion can complete between
+ * enablement and activation (for example on software without this
+ * feature, which may import the pool read-write while the feature is
+ * only enabled).  Blocks written in between were charged at the legacy
+ * ratio and must keep it.
+ */
+void
+spa_raidz_expand_acct_activate(spa_t *spa, dmu_tx_t *tx)
+{
+	uint64_t boundary = dmu_tx_get_txg(tx) + 1;
+
+	ASSERT(dmu_tx_is_syncing(tx));
+	ASSERT(spa_feature_is_enabled(spa,
+	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING));
+	ASSERT(!spa_feature_is_active(spa,
+	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING));
+
+	spa_feature_incr(spa, SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
+	VERIFY0(zap_update(spa->spa_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_RAIDZ_EXPAND_ACCT_TXG, sizeof (boundary), 1, &boundary,
+	    tx));
+	spa->spa_raidz_expand_acct_txg = boundary;
+}
+
 void
 vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 {
@@ -5243,20 +5288,14 @@ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 
 	/*
 	 * Activate per-block deflation ratio accounting if the user has
-	 * enabled the feature.  The enabled_txg recorded at enablement time
-	 * marks the boundary: blocks born before it use the legacy fixed
-	 * ratio, blocks born at or after use per-birth-txg ratios.
+	 * enabled the feature.  See spa_raidz_expand_acct_activate() for
+	 * how the boundary txg is chosen.
 	 */
 	if (spa_feature_is_enabled(spa,
 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING) &&
 	    !spa_feature_is_active(spa,
-	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING)) {
-		spa_feature_incr(spa,
-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
-		VERIFY(spa_feature_enabled_txg(spa,
-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
-		    &spa->spa_raidz_expand_acct_txg));
-	}
+	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING))
+		spa_raidz_expand_acct_activate(spa, tx);
 
 	vdrz->vd_physical_width++;
 

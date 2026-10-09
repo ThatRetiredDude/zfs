@@ -32,6 +32,7 @@
 #include <sys/dmu_tx.h>
 #include "zfeature_common.h"
 #include <sys/spa_impl.h>
+#include <sys/vdev_raidz.h>
 
 /*
  * ZFS Feature Flags
@@ -404,14 +405,11 @@ feature_enable_sync(spa_t *spa, zfeature_info_t *feature, dmu_tx_t *tx)
 	/*
 	 * If raidz_expansion_accounting is enabled on a pool that has
 	 * already been expanded, activate it immediately so the new
-	 * per-block deflation ratios take effect from this txg onward.
+	 * per-block deflation ratios take effect from the next txg onward.
 	 */
 	if (feature->fi_feature == SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING &&
-	    spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EXPANSION)) {
-		spa_feature_incr(spa,
-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
-		spa->spa_raidz_expand_acct_txg = dmu_tx_get_txg(tx);
-	}
+	    spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EXPANSION))
+		spa_raidz_expand_acct_activate(spa, tx);
 }
 
 static void

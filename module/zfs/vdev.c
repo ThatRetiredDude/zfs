@@ -2108,7 +2108,7 @@ vdev_open_children_subset(vdev_t *vd, vdev_open_children_func_t *open_func)
  * the actual usable capacity for new writes after RAIDZ expansion.
  * The txg-0-based ratio is preserved for persistent per-block accounting.
  */
-static void
+void
 vdev_set_deflate_ratio(vdev_t *vd)
 {
 	if (vd == vd->vdev_top && !vd->vdev_ishole && vd->vdev_ashift != 0) {
@@ -5398,6 +5398,13 @@ vdev_get_deflate_ratio(vdev_t *vd, uint64_t birth_txg)
 	 */
 	uint64_t acct_txg = vd->vdev_spa->spa_raidz_expand_acct_txg;
 	if (acct_txg == 0 || birth_txg < acct_txg)
+		return (vd->vdev_deflate_ratio);
+
+	/*
+	 * Only RAIDZ asize depends on the txg; skip the vd_expand_lock
+	 * lookup for everything else.
+	 */
+	if (vd->vdev_ops != &vdev_raidz_ops)
 		return (vd->vdev_deflate_ratio);
 
 	uint64_t asize_at_birth = vdev_psize_to_asize_txg(vd, 1 << 17,
