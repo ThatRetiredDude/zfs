@@ -1,0 +1,692 @@
+From bc7932ab56a99f71529630b22d7dadb7e67c14d7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 16:26:21 +0000
+Subject: [PATCH] raidz: fix born/free boundary of raidz_expansion_accounting
+
+Follow-up fixes for "raidz: fix space accounting after expansion".
+
+- Use the txg after activation as the per-birth-txg boundary, and
+  persist it in the MOS (org.openzfs:raidz_expansion_accounting_txg)
+  instead of deriving it from enabled_txg.  Sync tasks run after dirty
+  datasets are synced, so blocks born in the activating txg were
+  charged at the legacy ratio and must be freed at it.  enabled_txg is
+  also wrong when an expansion completed between enablement and
+  activation (e.g. on software without this feature).  The feature no
+  longer depends on enabled_txg.
+- Always (re)assign spa_raidz_expand_acct_txg on load and clear it in
+  spa_unload(), so spa_load_retry() rewinds cannot keep a stale value.
+- Recompute vdev_deflate_ratio_current when a reflow completes, so the
+  capacity correction applies without re-importing the pool.
+- Exclude the embedded log metaslab's free space from the correction,
+  read vdev stats under vdev_stat_lock, and share one helper between
+  spa_update_dspace() and spa_prop_get_config().
+- Skip the vd_expand_lock lookup in vdev_get_deflate_ratio() for
+  non-RAIDZ vdevs.
+- zpool-features.7: the feature is read-only compatible, and activates
+  immediately when enabled on an already-expanded pool.
+- Add raidz_expand_013_pos for blocks born in the enabling txg.
+
+Not addressed: once the feature is active, spa_update_dspace() still
+values post-boundary allocations at the legacy ratio, so available
+space is understated; see the XXX comment in spa_update_dspace().
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XvgHK45cnYrpn5XYhADD6T
+---
+ include/sys/dmu.h                             |   2 +
+ include/sys/spa.h                             |   1 +
+ include/sys/vdev_impl.h                       |   1 +
+ include/sys/vdev_raidz.h                      |   1 +
+ man/man7/zpool-features.7                     |   8 +-
+ module/zcommon/zfeature_common.c              |  18 +--
+ module/zfs/spa.c                              |  58 +++----
+ module/zfs/spa_misc.c                         | 105 ++++++++-----
+ module/zfs/vdev.c                             |   9 +-
+ module/zfs/vdev_raidz.c                       |  59 ++++++--
+ module/zfs/zfeature.c                         |  10 +-
+ tests/runfiles/common.run                     |   3 +-
+ tests/zfs-tests/tests/Makefile.am             |   1 +
+ .../functional/raidz/raidz_expand_013_pos.ksh | 141 ++++++++++++++++++
+ 14 files changed, 310 insertions(+), 107 deletions(-)
+ create mode 100755 tests/zfs-tests/tests/functional/raidz/raidz_expand_013_pos.ksh
+
+diff --git a/include/sys/dmu.h b/include/sys/dmu.h
+index 7db5a04..2ec756b 100644
+--- a/include/sys/dmu.h
++++ b/include/sys/dmu.h
+@@ -417,6 +417,8 @@ typedef struct dmu_buf {
+ #define	DMU_POOL_TXG_LOG_TIME_MINUTES	"com.klarasystems:txg_log_time:minutes"
+ #define	DMU_POOL_TXG_LOG_TIME_DAYS	"com.klarasystems:txg_log_time:days"
+ #define	DMU_POOL_TXG_LOG_TIME_MONTHS	"com.klarasystems:txg_log_time:months"
++#define	DMU_POOL_RAIDZ_EXPAND_ACCT_TXG	\
++	"org.openzfs:raidz_expansion_accounting_txg"
+ 
+ /*
+  * Allocate an object from this objset.  The range of object numbers
+diff --git a/include/sys/spa.h b/include/sys/spa.h
+index dfafb10..9a0f0a9 100644
+--- a/include/sys/spa.h
++++ b/include/sys/spa.h
+@@ -1157,6 +1157,7 @@ extern boolean_t spa_has_spare(spa_t *, uint64_t guid);
+ extern uint64_t dva_get_dsize_sync(spa_t *spa, const dva_t *dva,
+     uint64_t birth_txg);
+ extern uint64_t bp_get_dsize_sync(spa_t *spa, const blkptr_t *bp);
++extern int64_t spa_raidz_expand_dspace_correction(spa_t *spa);
+ extern uint64_t bp_get_dsize(spa_t *spa, const blkptr_t *bp);
+ extern boolean_t spa_has_dedup(spa_t *spa);
+ extern boolean_t spa_has_slogs(spa_t *spa);
+diff --git a/include/sys/vdev_impl.h b/include/sys/vdev_impl.h
+index ec48e64..5140877 100644
+--- a/include/sys/vdev_impl.h
++++ b/include/sys/vdev_impl.h
+@@ -624,6 +624,7 @@ extern uint64_t vdev_default_asize(vdev_t *vd, uint64_t psize, uint64_t txg);
+ extern uint64_t vdev_default_min_asize(vdev_t *vd);
+ extern uint64_t vdev_get_min_asize(vdev_t *vd);
+ extern void vdev_set_min_asize(vdev_t *vd);
++extern void vdev_set_deflate_ratio(vdev_t *vd);
+ extern uint64_t vdev_get_nparity(vdev_t *vd);
+ extern uint64_t vdev_get_ndisks(vdev_t *vd);
+ 
+diff --git a/include/sys/vdev_raidz.h b/include/sys/vdev_raidz.h
+index df8c2ae..e11cf92 100644
+--- a/include/sys/vdev_raidz.h
++++ b/include/sys/vdev_raidz.h
+@@ -162,6 +162,7 @@ typedef struct vdev_raidz {
+ 
+ extern int vdev_raidz_attach_check(vdev_t *);
+ extern void vdev_raidz_attach_sync(void *, dmu_tx_t *);
++extern void spa_raidz_expand_acct_activate(spa_t *, dmu_tx_t *);
+ extern void spa_start_raidz_expansion_thread(spa_t *);
+ extern int spa_raidz_expand_get_stats(spa_t *, pool_raidz_expand_stat_t *);
+ extern int vdev_raidz_load(vdev_t *);
+diff --git a/man/man7/zpool-features.7 b/man/man7/zpool-features.7
+index b61642c..efea4be 100644
+--- a/man/man7/zpool-features.7
++++ b/man/man7/zpool-features.7
+@@ -930,7 +930,7 @@ amount usable space in the pool.
+ See
+ .Xr zpool-attach 8 .
+ .
+-.feature org.openzfs raidz_expansion_accounting no enabled_txg
++.feature org.openzfs raidz_expansion_accounting yes
+ This feature enables correct per-block space accounting after RAIDZ
+ expansion.
+ When a RAIDZ vdev is expanded, the deflation ratio changes because
+@@ -943,8 +943,12 @@ transaction group.
+ .Pp
+ This feature becomes
+ .Sy active
+-when a RAIDZ expansion is initiated and will never return to being
++when a RAIDZ expansion is initiated, or immediately when it is enabled on
++a pool that already contains an expanded RAIDZ vdev, and will never return
++to being
+ .Sy enabled .
++Once it is active, software that does not support it can import the pool
++only read-only.
+ .
+ .feature com.delphix redaction_bookmarks no bookmarks extensible_dataset
+ This feature enables the use of redacted
+diff --git a/module/zcommon/zfeature_common.c b/module/zcommon/zfeature_common.c
+index dc584f6..ebd1772 100644
+--- a/module/zcommon/zfeature_common.c
++++ b/module/zcommon/zfeature_common.c
+@@ -774,18 +774,12 @@ zpool_feature_init(void)
+ 	    "Support for raidz expansion",
+ 	    ZFEATURE_FLAG_MOS, ZFEATURE_TYPE_BOOLEAN, NULL, sfeatures);
+ 
+-	{
+-		static const spa_feature_t raidz_expand_acct_deps[] = {
+-			SPA_FEATURE_ENABLED_TXG,
+-			SPA_FEATURE_NONE
+-		};
+-		zfeature_register(SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
+-		    "org.openzfs:raidz_expansion_accounting",
+-		    "raidz_expansion_accounting",
+-		    "Per-block deflation ratio after raidz expansion",
+-		    ZFEATURE_FLAG_READONLY_COMPAT,
+-		    ZFEATURE_TYPE_BOOLEAN, raidz_expand_acct_deps, sfeatures);
+-	}
++	zfeature_register(SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
++	    "org.openzfs:raidz_expansion_accounting",
++	    "raidz_expansion_accounting",
++	    "Per-block deflation ratio after raidz expansion",
++	    ZFEATURE_FLAG_READONLY_COMPAT,
++	    ZFEATURE_TYPE_BOOLEAN, NULL, sfeatures);
+ 
+ 	zfeature_register(SPA_FEATURE_FAST_DEDUP,
+ 	    "com.klarasystems:fast_dedup", "fast_dedup",
+diff --git a/module/zfs/spa.c b/module/zfs/spa.c
+index fb57a3e..d7b05d0 100644
+--- a/module/zfs/spa.c
++++ b/module/zfs/spa.c
+@@ -491,39 +491,11 @@ spa_prop_get_config(spa_t *spa, nvlist_t *nv)
+ 		spa_prop_add_list(nv, ZPOOL_PROP_NAME, spa_name(spa), 0, src);
+ 
+ 		/*
+-		 * For expanded RAIDZ vdevs, the metaslab class dspace
+-		 * was computed using the original (txg 0) deflation
+-		 * ratio, which understates usable capacity.  Compute
+-		 * a correction for the normal class using only the
+-		 * FREE portion of each vdev.  See spa_update_dspace()
+-		 * for the rationale.
++		 * Revalue free space on expanded RAIDZ vdevs at the
++		 * current geometry; see spa_update_dspace().
+ 		 */
+-		int64_t normal_dspace_corr = 0;
+-		if (spa_deflate(spa)) {
+-			for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+-				vdev_t *vd = rvd->vdev_child[c];
+-				if (vd->vdev_mg == NULL ||
+-				    vd->vdev_mg->mg_class != mc)
+-					continue;
+-				if (vd->vdev_deflate_ratio_current != 0 &&
+-				    vd->vdev_deflate_ratio_current !=
+-				    vd->vdev_deflate_ratio) {
+-					uint64_t space =
+-					    vd->vdev_stat.vs_space;
+-					uint64_t aspace =
+-					    vd->vdev_stat.vs_alloc;
+-					uint64_t fspace = space - aspace;
+-					int64_t old_fs = (fspace >>
+-					    SPA_MINBLOCKSHIFT) *
+-					    vd->vdev_deflate_ratio;
+-					int64_t new_fs = (fspace >>
+-					    SPA_MINBLOCKSHIFT) *
+-					    vd->vdev_deflate_ratio_current;
+-					normal_dspace_corr +=
+-					    (new_fs - old_fs);
+-				}
+-			}
+-		}
++		int64_t normal_dspace_corr =
++		    spa_raidz_expand_dspace_correction(spa);
+ 
+ 		size = alloc = usable = used = 0;
+ 		spa_prop_add_metaslab_class(nv, mc, ZPOOL_MC_PROPS_NORMAL,
+@@ -2510,6 +2482,7 @@ spa_unload(spa_t *spa)
+ 	}
+ 
+ 	spa->spa_raidz_expand = NULL;
++	spa->spa_raidz_expand_acct_txg = 0;
+ 	spa->spa_checkpoint_txg = 0;
+ 
+ 	spa_config_exit(spa, SCL_ALL, spa);
+@@ -5343,15 +5316,24 @@ spa_ld_check_features(spa_t *spa, boolean_t *missing_feat_writep)
+ 	}
+ 
+ 	/*
+-	 * Cache the txg at which per-block deflate ratio accounting was
+-	 * enabled.  Blocks born before this txg use the legacy fixed ratio;
+-	 * blocks born at or after this txg use per-birth-txg ratios.
++	 * Load the boundary txg for per-block deflate ratio accounting
++	 * (see spa_raidz_expand_acct_activate()).  Blocks born before it
++	 * use the legacy fixed ratio; blocks born at or after it use
++	 * per-birth-txg ratios.  Always assign it, since a spa_t can be
++	 * reloaded (spa_load_retry()) at an older txg.
+ 	 */
++	spa->spa_raidz_expand_acct_txg = 0;
+ 	if (spa_feature_is_active(spa,
+ 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING)) {
+-		(void) spa_feature_enabled_txg(spa,
+-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
+-		    &spa->spa_raidz_expand_acct_txg);
++		error = zap_lookup(spa->spa_meta_objset,
++		    DMU_POOL_DIRECTORY_OBJECT, DMU_POOL_RAIDZ_EXPAND_ACCT_TXG,
++		    sizeof (uint64_t), 1, &spa->spa_raidz_expand_acct_txg);
++		if (error != 0 || spa->spa_raidz_expand_acct_txg == 0) {
++			spa_load_failed(spa, "raidz_expansion_accounting is "
++			    "active but its boundary txg is missing [error=%d]",
++			    error);
++			return (spa_vdev_err(rvd, VDEV_AUX_CORRUPT_DATA, EIO));
++		}
+ 	}
+ 
+ 	/*
+diff --git a/module/zfs/spa_misc.c b/module/zfs/spa_misc.c
+index 7c2d98d..ec42e73 100644
+--- a/module/zfs/spa_misc.c
++++ b/module/zfs/spa_misc.c
+@@ -2013,6 +2013,61 @@ spa_get_checkpoint_space(spa_t *spa)
+ 	return (spa->spa_checkpoint_info.sci_dspace);
+ }
+ 
++/*
++ * For expanded RAIDZ vdevs in the normal class, metaslab_class_get_dspace()
++ * deflates all space with the original (txg 0) ratio, which understates
++ * the capacity available to new writes.  Return the correction to apply:
++ * the vdev's FREE space revalued at the current-geometry ratio.  See
++ * spa_update_dspace() for why only free space is corrected.
++ *
++ * vs_space/vs_alloc cover every metaslab of the vdev, including an
++ * embedded log metaslab that belongs to the embedded log class rather
++ * than the normal class, so that metaslab's free space is excluded.
++ */
++int64_t
++spa_raidz_expand_dspace_correction(spa_t *spa)
++{
++	metaslab_class_t *mc = spa_normal_class(spa);
++	vdev_t *rvd = spa->spa_root_vdev;
++	int64_t correction = 0;
++
++	if (!spa_deflate(spa) || rvd == NULL)
++		return (0);
++
++	for (uint64_t c = 0; c < rvd->vdev_children; c++) {
++		vdev_t *vd = rvd->vdev_child[c];
++
++		if (vd->vdev_mg == NULL || vd->vdev_mg->mg_class != mc)
++			continue;
++		if (vd->vdev_deflate_ratio_current <= vd->vdev_deflate_ratio)
++			continue;
++
++		mutex_enter(&vd->vdev_stat_lock);
++		uint64_t space = vd->vdev_stat.vs_space;
++		uint64_t alloc = vd->vdev_stat.vs_alloc;
++		mutex_exit(&vd->vdev_stat_lock);
++		uint64_t fspace = (space > alloc) ? space - alloc : 0;
++
++		metaslab_group_t *lmg = vd->vdev_log_mg;
++		if (lmg != NULL) {
++			avl_tree_t *t = &lmg->mg_metaslab_tree;
++			mutex_enter(&lmg->mg_lock);
++			for (metaslab_t *msp = avl_first(t); msp != NULL;
++			    msp = AVL_NEXT(t, msp)) {
++				uint64_t lfree = msp->ms_size -
++				    metaslab_allocated_space(msp);
++				fspace -= MIN(fspace, lfree);
++			}
++			mutex_exit(&lmg->mg_lock);
++		}
++
++		correction += (fspace >> SPA_MINBLOCKSHIFT) *
++		    (vd->vdev_deflate_ratio_current - vd->vdev_deflate_ratio);
++	}
++
++	return (correction);
++}
++
+ void
+ spa_update_dspace(spa_t *spa)
+ {
+@@ -2024,47 +2079,23 @@ spa_update_dspace(spa_t *spa)
+ 	 * usable capacity.  Apply a correction using the current geometry
+ 	 * ratio, but only for the FREE portion of the vdev.
+ 	 *
+-	 * The allocated portion must remain at the old ratio because
+-	 * dd_used_bytes (tracked per-block via bp_get_dsize_sync) also
+-	 * uses the old ratio for blocks born before the expansion
+-	 * accounting feature was enabled.  Correcting only the free
+-	 * portion keeps spa_rdspace - dd_used_bytes = true available.
++	 * The allocated portion stays at the old ratio because, while the
++	 * raidz_expansion_accounting feature is inactive, dd_used_bytes
++	 * charges every block at that ratio (bp_get_dsize_sync()).  Then
++	 * spa_rdspace - dd_used_bytes == free space at the current ratio,
++	 * exactly, whatever the block sizes.
+ 	 *
+-	 * As old blocks are rewritten with the new geometry, vs_alloc
+-	 * shrinks (less physical space per block) and the correction
+-	 * automatically grows, converging to the full correction after
+-	 * a complete rewrite.
++	 * XXX Once the feature is active this no longer holds: blocks born
++	 * at or after spa_raidz_expand_acct_txg are charged at their birth
++	 * ratio, but are still counted here at the old ratio, so available
++	 * space is understated by (birth ratio - old ratio) for each of
++	 * them.  Fixing that needs the allocated space charged at each
++	 * ratio to be tracked per vdev; see the review notes.
+ 	 *
+ 	 * Only correct vdevs in the normal class, matching spa_rdspace's
+-	 * derivation from spa_normal_class().  RAIDZ vdevs in the special
+-	 * or dedup class contribute only allocated (not free) space to
+-	 * spa_dspace via metaslab_class_get_dalloc(), so they do not need
+-	 * a free-space correction.
++	 * derivation from spa_normal_class().
+ 	 */
+-	if (spa_deflate(spa)) {
+-		metaslab_class_t *mc = spa_normal_class(spa);
+-		vdev_t *rvd = spa->spa_root_vdev;
+-		for (uint64_t c = 0; c < rvd->vdev_children; c++) {
+-			vdev_t *vd = rvd->vdev_child[c];
+-			if (vd->vdev_mg == NULL ||
+-			    vd->vdev_mg->mg_class != mc)
+-				continue;
+-			if (vd->vdev_deflate_ratio_current != 0 &&
+-			    vd->vdev_deflate_ratio_current !=
+-			    vd->vdev_deflate_ratio) {
+-				uint64_t space = vd->vdev_stat.vs_space;
+-				uint64_t aspace = vd->vdev_stat.vs_alloc;
+-				uint64_t fspace = space - aspace;
+-				int64_t old_fs = (fspace >>
+-				    SPA_MINBLOCKSHIFT) *
+-				    vd->vdev_deflate_ratio;
+-				int64_t new_fs = (fspace >>
+-				    SPA_MINBLOCKSHIFT) *
+-				    vd->vdev_deflate_ratio_current;
+-				spa->spa_rdspace += (new_fs - old_fs);
+-			}
+-		}
+-	}
++	spa->spa_rdspace += spa_raidz_expand_dspace_correction(spa);
+ 
+ 	if (spa->spa_nonallocating_dspace > 0) {
+ 		/*
+diff --git a/module/zfs/vdev.c b/module/zfs/vdev.c
+index 18138a0..8316844 100644
+--- a/module/zfs/vdev.c
++++ b/module/zfs/vdev.c
+@@ -2108,7 +2108,7 @@ vdev_open_children_subset(vdev_t *vd, vdev_open_children_func_t *open_func)
+  * the actual usable capacity for new writes after RAIDZ expansion.
+  * The txg-0-based ratio is preserved for persistent per-block accounting.
+  */
+-static void
++void
+ vdev_set_deflate_ratio(vdev_t *vd)
+ {
+ 	if (vd == vd->vdev_top && !vd->vdev_ishole && vd->vdev_ashift != 0) {
+@@ -5400,6 +5400,13 @@ vdev_get_deflate_ratio(vdev_t *vd, uint64_t birth_txg)
+ 	if (acct_txg == 0 || birth_txg < acct_txg)
+ 		return (vd->vdev_deflate_ratio);
+ 
++	/*
++	 * Only RAIDZ asize depends on the txg; skip the vd_expand_lock
++	 * lookup for everything else.
++	 */
++	if (vd->vdev_ops != &vdev_raidz_ops)
++		return (vd->vdev_deflate_ratio);
++
+ 	uint64_t asize_at_birth = vdev_psize_to_asize_txg(vd, 1 << 17,
+ 	    birth_txg);
+ 	return ((1 << 17) / (asize_at_birth >> SPA_MINBLOCKSHIFT));
+diff --git a/module/zfs/vdev_raidz.c b/module/zfs/vdev_raidz.c
+index 5634ad4..7b6fb35 100644
+--- a/module/zfs/vdev_raidz.c
++++ b/module/zfs/vdev_raidz.c
+@@ -4228,6 +4228,13 @@ raidz_reflow_complete_sync(void *arg, dmu_tx_t *tx)
+ 	avl_add(&vdrz->vd_expand_txgs, re);
+ 	mutex_exit(&vdrz->vd_expand_lock);
+ 
++	/*
++	 * Recompute vdev_deflate_ratio_current now that the new logical
++	 * width is in vd_expand_txgs, so capacity reporting reflects the
++	 * new geometry without waiting for the pool to be re-imported.
++	 */
++	vdev_set_deflate_ratio(raidvd);
++
+ 	vdev_t *vd = vdev_lookup_top(spa, vre->vre_vdev_id);
+ 
+ 	/*
+@@ -5225,6 +5232,44 @@ vdev_raidz_attach_check(vdev_t *new_child)
+ 	return (0);
+ }
+ 
++/*
++ * Activate the raidz_expansion_accounting feature.  From the returned
++ * boundary txg onward, blocks are charged with the deflate ratio of the
++ * geometry they were born under (vdev_get_deflate_ratio()); blocks born
++ * earlier keep the legacy txg-0 ratio.
++ *
++ * The boundary is the txg AFTER activation, not the activation txg:
++ * this runs from a sync task, and dsl_pool_sync() runs sync tasks only
++ * after every dirty dataset (and the MOS) has been written in pass 1, so
++ * blocks born earlier in this same txg were already charged at the
++ * legacy ratio.  Using this txg as the boundary would free them at a
++ * different ratio than they were born with.
++ *
++ * The boundary is persisted in the MOS rather than derived from the
++ * feature's enabled_txg, because an expansion can complete between
++ * enablement and activation (for example on software without this
++ * feature, which may import the pool read-write while the feature is
++ * only enabled).  Blocks written in between were charged at the legacy
++ * ratio and must keep it.
++ */
++void
++spa_raidz_expand_acct_activate(spa_t *spa, dmu_tx_t *tx)
++{
++	uint64_t boundary = dmu_tx_get_txg(tx) + 1;
++
++	ASSERT(dmu_tx_is_syncing(tx));
++	ASSERT(spa_feature_is_enabled(spa,
++	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING));
++	ASSERT(!spa_feature_is_active(spa,
++	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING));
++
++	spa_feature_incr(spa, SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
++	VERIFY0(zap_update(spa->spa_meta_objset, DMU_POOL_DIRECTORY_OBJECT,
++	    DMU_POOL_RAIDZ_EXPAND_ACCT_TXG, sizeof (boundary), 1, &boundary,
++	    tx));
++	spa->spa_raidz_expand_acct_txg = boundary;
++}
++
+ void
+ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
+ {
+@@ -5243,20 +5288,14 @@ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
+ 
+ 	/*
+ 	 * Activate per-block deflation ratio accounting if the user has
+-	 * enabled the feature.  The enabled_txg recorded at enablement time
+-	 * marks the boundary: blocks born before it use the legacy fixed
+-	 * ratio, blocks born at or after use per-birth-txg ratios.
++	 * enabled the feature.  See spa_raidz_expand_acct_activate() for
++	 * how the boundary txg is chosen.
+ 	 */
+ 	if (spa_feature_is_enabled(spa,
+ 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING) &&
+ 	    !spa_feature_is_active(spa,
+-	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING)) {
+-		spa_feature_incr(spa,
+-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
+-		VERIFY(spa_feature_enabled_txg(spa,
+-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
+-		    &spa->spa_raidz_expand_acct_txg));
+-	}
++	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING))
++		spa_raidz_expand_acct_activate(spa, tx);
+ 
+ 	vdrz->vd_physical_width++;
+ 
+diff --git a/module/zfs/zfeature.c b/module/zfs/zfeature.c
+index 421b17b..01c887e 100644
+--- a/module/zfs/zfeature.c
++++ b/module/zfs/zfeature.c
+@@ -32,6 +32,7 @@
+ #include <sys/dmu_tx.h>
+ #include "zfeature_common.h"
+ #include <sys/spa_impl.h>
++#include <sys/vdev_raidz.h>
+ 
+ /*
+  * ZFS Feature Flags
+@@ -404,14 +405,11 @@ feature_enable_sync(spa_t *spa, zfeature_info_t *feature, dmu_tx_t *tx)
+ 	/*
+ 	 * If raidz_expansion_accounting is enabled on a pool that has
+ 	 * already been expanded, activate it immediately so the new
+-	 * per-block deflation ratios take effect from this txg onward.
++	 * per-block deflation ratios take effect from the next txg onward.
+ 	 */
+ 	if (feature->fi_feature == SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING &&
+-	    spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EXPANSION)) {
+-		spa_feature_incr(spa,
+-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
+-		spa->spa_raidz_expand_acct_txg = dmu_tx_get_txg(tx);
+-	}
++	    spa_feature_is_active(spa, SPA_FEATURE_RAIDZ_EXPANSION))
++		spa_raidz_expand_acct_activate(spa, tx);
+ }
+ 
+ static void
+diff --git a/tests/runfiles/common.run b/tests/runfiles/common.run
+index c570af2..8198aac 100644
+--- a/tests/runfiles/common.run
++++ b/tests/runfiles/common.run
+@@ -922,7 +922,8 @@ tests = ['raidz_001_neg', 'raidz_002_pos', 'raidz_expand_001_pos',
+     'raidz_expand_004_pos', 'raidz_expand_005_pos', 'raidz_expand_006_neg',
+     'raidz_expand_007_neg', 'raidz_expand_008_pos',
+     'raidz_expand_009_pos', 'raidz_expand_010_pos',
+-    'raidz_expand_011_pos', 'raidz_expand_012_pos', 'raidz_zinject']
++    'raidz_expand_011_pos', 'raidz_expand_012_pos',
++    'raidz_expand_013_pos', 'raidz_zinject']
+ tags = ['functional', 'raidz']
+ timeout = 1200
+ 
+diff --git a/tests/zfs-tests/tests/Makefile.am b/tests/zfs-tests/tests/Makefile.am
+index 426d90c..8917551 100644
+--- a/tests/zfs-tests/tests/Makefile.am
++++ b/tests/zfs-tests/tests/Makefile.am
+@@ -1961,6 +1961,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
+ 	functional/raidz/raidz_expand_010_pos.ksh \
+ 	functional/raidz/raidz_expand_011_pos.ksh \
+ 	functional/raidz/raidz_expand_012_pos.ksh \
++	functional/raidz/raidz_expand_013_pos.ksh \
+ 	functional/raidz/raidz_zinject.ksh \
+ 	functional/raidz/setup.ksh \
+ 	functional/redacted_send/cleanup.ksh \
+diff --git a/tests/zfs-tests/tests/functional/raidz/raidz_expand_013_pos.ksh b/tests/zfs-tests/tests/functional/raidz/raidz_expand_013_pos.ksh
+new file mode 100755
+index 0000000..bd17ad6
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/raidz/raidz_expand_013_pos.ksh
+@@ -0,0 +1,141 @@
++#!/bin/ksh -p
++# SPDX-License-Identifier: CDDL-1.0
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or http://www.opensolaris.org/os/licensing.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright (c) 2026 by Skountz. All rights reserved.
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++#
++# DESCRIPTION:
++#	Blocks born in the same txg in which raidz_expansion_accounting is
++#	enabled (on an already-expanded pool) must be freed with the same
++#	deflated size they were charged at birth.
++#
++#	Sync tasks run after dirty datasets are synced, so data dirtied in
++#	the enabling txg is charged before the feature activates.  If the
++#	per-birth-txg boundary were the enabling txg itself, those blocks
++#	would be freed at the new (larger) ratio and the dataset's used
++#	space would drop below its starting value (or wrap).
++#
++# STRATEGY:
++#	1. Create a RAIDZ1 pool with 3 disks, feature disabled
++#	2. Expand to 4 disks and wait for the expansion to finish
++#	3. Record the dataset's used space
++#	4. With a long txg timeout, dirty data and enable the feature so
++#	   both land in the same txg
++#	5. Delete the data and verify used space returns to its baseline
++#	6. Repeat the delete check after export/import
++#
++
++typeset -r devs=4
++typeset -r dev_size_mb=512
++typeset -r write_mb=32
++
++typeset -a disks
++
++txg_timeout=$(get_tunable TXG_TIMEOUT)
++
++function cleanup
++{
++	log_must set_tunable64 TXG_TIMEOUT $txg_timeout
++	poolexists "$TESTPOOL" && log_must_busy zpool destroy "$TESTPOOL"
++
++	for i in {1..$devs}; do
++		log_must rm -f "$TEST_BASE_DIR/dev-$i"
++	done
++}
++
++log_onexit cleanup
++
++for i in {1..$devs}; do
++	device=$TEST_BASE_DIR/dev-$i
++	log_must truncate -s ${dev_size_mb}M $device
++	disks[${#disks[*]}+1]=$device
++done
++
++pool=$TESTPOOL
++
++function check_used # <label> <baseline>
++{
++	typeset label=$1
++	typeset baseline=$2
++	typeset used=$(zfs get -Hpo value used $pool/fs)
++	typeset slack=$((1024 * 1024))
++
++	log_note "$label: used=$used baseline=$baseline"
++	if [[ $used -lt $(($baseline - $slack)) ||
++	    $used -gt $(($baseline + $slack)) ]]; then
++		log_fail "$label: used ($used) does not match baseline" \
++		    "($baseline); blocks were freed with a different" \
++		    "deflated size than they were born with."
++	fi
++}
++
++log_must zpool create -f -o cachefile=none \
++    -o feature@raidz_expansion_accounting=disabled \
++    $pool raidz1 ${disks[1..3]}
++log_must zfs create $pool/fs
++
++log_must zpool attach -w $pool raidz1-0 ${disks[4]}
++is_pool_scrubbing $pool && wait_scrubbed $pool
++log_must sync_pool $pool
++
++typeset baseline=$(zfs get -Hpo value used $pool/fs)
++
++#
++# Keep the open txg open long enough that the dirty data and the
++# feature-enable sync task are synced in the same txg.
++#
++log_must set_tunable64 TXG_TIMEOUT 600
++log_must dd if=/dev/urandom of=/$pool/fs/same_txg bs=1M count=$write_mb
++log_must zpool set feature@raidz_expansion_accounting=enabled $pool
++log_must set_tunable64 TXG_TIMEOUT $txg_timeout
++
++typeset feat=$(zpool list -H -o feature@raidz_expansion_accounting $pool)
++[[ "$feat" == "active" ]] || log_fail "feature should be active, got $feat"
++
++# Data written after activation, for comparison.
++log_must dd if=/dev/urandom of=/$pool/fs/after bs=1M count=$write_mb
++log_must sync_pool $pool
++
++log_must rm -f /$pool/fs/same_txg
++log_must sync_pool $pool
++log_must rm -f /$pool/fs/after
++log_must sync_pool $pool
++check_used "after delete" $baseline
++
++# The boundary must be the same after re-import.
++log_must dd if=/dev/urandom of=/$pool/fs/again bs=1M count=$write_mb
++log_must sync_pool $pool
++log_must zpool export $pool
++log_must zpool import -d $TEST_BASE_DIR $pool
++log_must rm -f /$pool/fs/again
++log_must sync_pool $pool
++check_used "after re-import and delete" $baseline
++
++log_must zpool scrub -w $pool
++verify_pool $pool
++
++log_pass "Blocks born in the enabling txg are freed with their birth size."
+-- 
+2.43.0
+
