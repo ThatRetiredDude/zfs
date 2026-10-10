@@ -539,3 +539,22 @@ spa_feature_enabled_txg(spa_t *spa, spa_feature_t fid, uint64_t *txg)
 
 	return (err == 0);
 }
+
+/*
+ * Overwrite the recorded enabled_txg of an enabled feature.  Used when a
+ * feature's on-disk meaning is tied to the txg it was activated in rather
+ * than the txg it was enabled in.
+ */
+void
+spa_feature_set_enabled_txg(spa_t *spa, spa_feature_t fid, uint64_t txg,
+    dmu_tx_t *tx)
+{
+	zfeature_info_t *feature = &spa_feature_table[fid];
+
+	ASSERT(dmu_tx_is_syncing(tx));
+	ASSERT(spa_feature_is_enabled(spa, fid));
+	ASSERT3U(spa->spa_feat_enabled_txg_obj, !=, 0);
+	VERIFY0(zap_update(spa->spa_meta_objset,
+	    spa->spa_feat_enabled_txg_obj, feature->fi_guid,
+	    sizeof (uint64_t), 1, &txg, tx));
+}
