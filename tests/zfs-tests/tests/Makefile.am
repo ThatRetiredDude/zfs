@@ -366,6 +366,10 @@ nobase_dist_datadir_zfs_tests_tests_DATA += \
 	functional/raidz/blockfiles/raidz_dedup_overrun-1.dat.bz2 \
 	functional/raidz/blockfiles/raidz_dedup_overrun-2.dat.bz2 \
 	functional/raidz/blockfiles/raidz_dedup_overrun-3.dat.bz2 \
+	functional/raidz/blockfiles/raidz_expand_016-0.dat.bz2 \
+	functional/raidz/blockfiles/raidz_expand_016-1.dat.bz2 \
+	functional/raidz/blockfiles/raidz_expand_016-2.dat.bz2 \
+	functional/raidz/blockfiles/raidz_expand_016-3.dat.bz2 \
 	functional/redacted_send/redacted.cfg \
 	functional/redacted_send/redacted.kshlib \
 	functional/redundancy/redundancy.cfg \
@@ -2026,6 +2030,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/raidz_expand_013_pos.ksh \
 	functional/raidz/raidz_expand_014_pos.ksh \
 	functional/raidz/raidz_expand_015_pos.ksh \
+	functional/raidz/raidz_expand_016_pos.ksh \
 	functional/raidz/raidz_zinject.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
