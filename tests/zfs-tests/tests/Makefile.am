@@ -2026,6 +2026,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/raidz/raidz_expand_013_pos.ksh \
 	functional/raidz/raidz_expand_014_pos.ksh \
 	functional/raidz/raidz_expand_015_pos.ksh \
+	functional/raidz/raidz_expand_017_pos.ksh \
 	functional/raidz/raidz_zinject.ksh \
 	functional/raidz/setup.ksh \
 	functional/redacted_send/cleanup.ksh \
