@@ -5364,19 +5364,23 @@ vdev_raidz_attach_sync(void *arg, dmu_tx_t *tx)
 
 	/*
 	 * Activate per-block deflation ratio accounting if the user has
-	 * enabled the feature.  The enabled_txg recorded at enablement time
-	 * marks the boundary: blocks born in or before it use the legacy
-	 * fixed ratio, blocks born after use per-birth-txg ratios.
+	 * enabled the feature.  The boundary is this (activating) txg, not
+	 * the txg the feature was enabled in: if the pool was expanded in
+	 * between by software without this feature, blocks born since then
+	 * were charged at the legacy ratio.  Record it as the feature's
+	 * enabled_txg so the same boundary is used after import.
 	 */
 	if (spa_feature_is_enabled(spa,
 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING) &&
 	    !spa_feature_is_active(spa,
 	    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING)) {
+		uint64_t txg = dmu_tx_get_txg(tx);
+
 		spa_feature_incr(spa,
 		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, tx);
-		VERIFY(spa_feature_enabled_txg(spa,
-		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING,
-		    &spa->spa_raidz_expand_acct_txg));
+		spa_feature_set_enabled_txg(spa,
+		    SPA_FEATURE_RAIDZ_EXPANSION_ACCOUNTING, txg, tx);
+		spa->spa_raidz_expand_acct_txg = txg;
 	}
 
 	vdrz->vd_physical_width++;
