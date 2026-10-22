@@ -3333,9 +3333,15 @@ vdev_dtl_should_excise(vdev_t *vd, boolean_t rebuild_done)
 		vdev_rebuild_t *vr = &vd->vdev_top->vdev_rebuild_config;
 		vdev_rebuild_phys_t *vrp = &vr->vr_rebuild_phys;
 
-		/* Rebuild not initiated by attach */
+		/*
+		 * Rebuild I/O has no birth txg, so apart from read errors it
+		 * only repairs leaves missing every txg, i.e. those attached
+		 * for the rebuild.  Any other leaf with missing data, e.g.
+		 * one onlined while the rebuild ran, keeps its DTL for a
+		 * healing resilver.
+		 */
 		if (vd->vdev_rebuild_txg == 0)
-			return (B_TRUE);
+			return (B_FALSE);
 
 		/*
 		 * When a rebuild completes without error then all missing data
