@@ -965,13 +965,23 @@ dsl_scan_resilver_first(dsl_pool_t *dp)
 int
 dsl_scan_setup_check(void *arg, dmu_tx_t *tx)
 {
-	(void) arg;
+	pool_scan_func_t func = *(pool_scan_func_t *)arg;
 	dsl_scan_t *scn = dmu_tx_pool(tx)->dp_scan;
 	vdev_t *rvd = scn->scn_dp->dp_spa->spa_root_vdev;
 
 	if (dsl_scan_is_running(scn) || vdev_rebuild_active(rvd) ||
 	    dsl_errorscrubbing(scn->scn_dp))
 		return (SET_ERROR(EBUSY));
+
+	/*
+	 * A device that missed writes must be healed by a resilver first.
+	 * A scrub started now would be narrowed to its DTL range and would
+	 * also clear any pending resilver restart in dsl_scan_setup_sync().
+	 */
+	if (func == POOL_SCAN_SCRUB &&
+	    (dsl_scan_resilver_scheduled(scn->scn_dp) ||
+	    (dmu_tx_is_syncing(tx) && dsl_scan_resilver_first(scn->scn_dp))))
+		return (SET_ERROR(ZFS_ERR_RESILVER_IN_PROGRESS));
 
 	return (0);
 }
@@ -1230,9 +1240,21 @@ dsl_scan(dsl_pool_t *dp, pool_scan_func_t func, uint64_t txgstart,
 	setup_sync_arg.txgend = txgend;
 	setup_sync_arg.flags = flags;
 
-	return (dsl_sync_task(spa_name(spa), dsl_scan_setup_check,
+	int err = dsl_sync_task(spa_name(spa), dsl_scan_setup_check,
 	    dsl_scan_setup_sync, &setup_sync_arg, 0,
-	    ZFS_SPACE_CHECK_EXTRA_RESERVED));
+	    ZFS_SPACE_CHECK_EXTRA_RESERVED);
+
+	/*
+	 * The scrub was refused because a device needs a resilver.  The
+	 * vdev_reopen() above did not request it (spa_scrub_reopen), and
+	 * a DTL left by failed writes never requests one, so make sure it
+	 * runs.
+	 */
+	if (err == ZFS_ERR_RESILVER_IN_PROGRESS && !dsl_scan_resilvering(dp) &&
+	    !dsl_scan_resilver_scheduled(dp))
+		spa_async_request(spa, SPA_ASYNC_RESILVER);
+
+	return (err);
 }
 
 static void

@@ -96,8 +96,12 @@ be read much more efficiently from disk when issuing the scrub I/O.
 If a scrub is paused, the
 .Nm zpool Cm scrub
 resumes it.
-If a resilver is in progress, ZFS does not allow a scrub to be started until the
-resilver completes.
+If a resilver is in progress, or a device that missed writes still needs one,
+ZFS does not allow a scrub to be started until the resilver completes.
+In the latter case, the resilver is started.
+While the pool has a checkpoint, a scrub is not refused for such a device,
+because a resilver cannot mark it as repaired until the checkpoint is
+discarded.
 .Pp
 Note that, due to changes in pool data on a live system, it is possible for
 scrubs and resilvers to progress beyond 100% completion.
