@@ -2379,6 +2379,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/slog/slog_014_pos.ksh \
 	functional/slog/slog_015_neg.ksh \
 	functional/slog/slog_016_pos.ksh \
+	functional/slog/slog_017_neg.ksh \
 	functional/slog/slog_indirect_shared_error.ksh \
 	functional/slog/slog_replay_fs_001.ksh \
 	functional/slog/slog_replay_fs_002.ksh \

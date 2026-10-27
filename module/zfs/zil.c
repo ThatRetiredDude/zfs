@@ -1162,6 +1162,64 @@ zil_destroy_sync(zilog_t *zilog, dmu_tx_t *tx)
 	    zil_free_log_record, tx, zilog->zl_header->zh_claim_txg, B_FALSE);
 }
 
+/*
+ * Check whether every block of the on-disk log chain that zil_destroy_sync()
+ * would read is on a readable vdev.  A read of a block whose vdevs are all
+ * unreadable fails with ENXIO and suspends the pool (see zio_done()), and
+ * while the caller holds spa_namespace_lock nothing can resume it.
+ */
+static int
+zil_readable_log_block(zilog_t *zilog, const blkptr_t *bp, void *arg,
+    uint64_t txg)
+{
+	(void) arg, (void) txg;
+	spa_t *spa = zilog->zl_spa;
+	int error = SET_ERROR(ENXIO);
+
+	spa_config_enter(spa, SCL_VDEV, FTAG, RW_READER);
+	for (int d = 0; d < BP_GET_NDVAS(bp); d++) {
+		vdev_t *vd = vdev_lookup_top(spa,
+		    DVA_GET_VDEV(&bp->blk_dva[d]));
+		if (vd != NULL && vdev_readable(vd)) {
+			error = 0;
+			break;
+		}
+	}
+	spa_config_exit(spa, SCL_VDEV, FTAG);
+
+	return (error);
+}
+
+/*
+ * Before zil_destroy() frees an on-disk log chain, make sure no block of the
+ * chain is on a vdev that can't be read.  Reading such a block would suspend
+ * the pool.  Only ENXIO stops the destroy: the normal end of the chain is a
+ * block that fails its checksum, and on a mirror with a failing child that
+ * end can come back as EIO.
+ */
+static int
+zil_check_destroy(zilog_t *zilog)
+{
+	const zil_header_t *zh = zilog->zl_header;
+	boolean_t empty;
+	int error;
+
+	mutex_enter(&zilog->zl_lock);
+	empty = list_is_empty(&zilog->zl_lwb_list);
+	mutex_exit(&zilog->zl_lock);
+
+	/* In-memory lwbs are freed without reading the chain. */
+	if (!empty || BP_IS_HOLE(&zh->zh_log))
+		return (0);
+
+	error = zil_parse(zilog, zil_readable_log_block, zil_noop_log_record,
+	    NULL, zh->zh_claim_txg, B_FALSE);
+	if (error == ENXIO)
+		return (error);
+
+	return (0);
+}
+
 int
 zil_claim(dsl_pool_t *dp, dsl_dataset_t *ds, void *txarg)
 {
@@ -4737,6 +4795,13 @@ zil_suspend(const char *osname, void **cookiep)
 		}
 	}
 
+	/*
+	 * When resetting the log (no cookie, e.g. removing or offlining a
+	 * log device), refuse instead of freeing a chain we can't read.
+	 */
+	if (error == 0 && cookiep == NULL)
+		error = zil_check_destroy(zilog);
+
 	if (error == 0)
 		zil_destroy(zilog, B_FALSE);
 
@@ -5251,6 +5316,9 @@ zil_reset(const char *osname, void *arg)
 	int error = zil_suspend(osname, NULL);
 	/* EACCES means crypto key not loaded */
 	if ((error == EACCES) || (error == EBUSY))
+		return (SET_ERROR(error));
+	/* ENXIO means part of the log chain is on a vdev that can't be read */
+	if (error == ENXIO)
 		return (SET_ERROR(error));
 	if (error != 0)
 		return (SET_ERROR(EEXIST));
